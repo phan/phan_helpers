@@ -1,0 +1,50 @@
+# Build artifacts
+*.lo
+*.la
+.libs/
+modules/
+*.o
+*.so
+
+# Autotools
+Makefile
+Makefile.fragments
+Makefile.global
+Makefile.objects
+acinclude.m4
+aclocal.m4
+autom4te.cache/
+build/
+config.guess
+config.h
+config.h.in
+config.log
+config.nice
+config.status
+config.sub
+configure
+configure.ac
+install-sh
+libtool
+ltmain.sh
+missing
+mkinstalldirs
+run-tests.php
+
+# Generated files
+.deps
+*.gcda
+*.gcno
+
+# IDE
+.vscode/
+.idea/
+
+# Tests
+tests/*.diff
+tests/*.exp
+tests/*.log
+tests/*.out
+tests/*.php
+tests/*.mem
+tests/*.sh
