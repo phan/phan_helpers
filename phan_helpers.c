@@ -23,10 +23,11 @@
 #include "php.h"
 #include "php_ini.h"
 #include "ext/standard/info.h"
+#include "ext/hash/php_hash.h"
+#include "ext/hash/php_hash_xxhash.h"
+#include "Zend/zend_smart_str.h"
 #include "php_phan_helpers.h"
 #include "phan_helpers_arginfo.h"
-#define XXH_INLINE_ALL
-#include "ext/hash/xxhash/xxhash.h"
 #include "Zend/zend_exceptions.h"
 
 /* {{{ PHP_FUNCTION(phan_unique_types)
@@ -113,170 +114,164 @@ PHP_FUNCTION(phan_unique_types)
 }
 /* }}} */
 
-/* Forward declarations for AST hashing */
-static void phan_hash_node_recursive(XXH3_state_t* state, zval *node);
-static void phan_hash_value(XXH3_state_t* state, zval *val);
+/* Forward declarations for XXH3-128-based hashing with normalization */
+static void phan_hash_node_xxh3(smart_str *str, zval *node);
+static void phan_hash_value_xxh3(smart_str *str, zval *val);
+static void phan_hash_key_xxh3(smart_str *str, zend_ulong idx, zend_string *key);
 
-/* {{{ phan_hash_value
- * Hash a primitive value (string, int, float, null) into XXH128 state
+/* {{{ phan_hash_key_xxh3
+ * Hash a key the same way PHP does: XXH3-128 for strings, packed format for integers
  */
-static void phan_hash_value(XXH3_state_t* state, zval *val)
+static void phan_hash_key_xxh3(smart_str *str, zend_ulong idx, zend_string *key)
 {
-    switch (Z_TYPE_P(val)) {
-        case IS_STRING:
-            XXH3_128bits_update(state, Z_STRVAL_P(val), Z_STRLEN_P(val));
-            break;
-        case IS_LONG: {
-            /* Pack integer as 8 bytes (little-endian) */
-            uint64_t num = (uint64_t)Z_LVAL_P(val);
-            XXH3_128bits_update(state, &num, sizeof(num));
-            break;
-        }
-        case IS_DOUBLE: {
-            /* Pack double as 8 bytes */
-            double num = Z_DVAL_P(val);
-            XXH3_128bits_update(state, &num, sizeof(num));
-            break;
-        }
-        case IS_NULL:
-            /* Hash a marker byte for null */
-            XXH3_128bits_update(state, "\x00", 1);
-            break;
-        case IS_OBJECT:
-            /* This is an AST node */
-            phan_hash_node_recursive(state, val);
-            break;
-        default:
-            /* Shouldn't happen, but hash type ID */
-            {
-                unsigned char type = Z_TYPE_P(val);
-                XXH3_128bits_update(state, &type, 1);
-            }
-            break;
+    if (key) {
+        /* String key - hash with XXH3-128 */
+        PHP_XXH3_128_CTX context;
+        unsigned char digest[16];
+        PHP_XXH3_128_Init(&context, NULL);
+        PHP_XXH3_128_Update(&context, (unsigned char *)ZSTR_VAL(key), ZSTR_LEN(key));
+        PHP_XXH3_128_Final(digest, &context);
+        smart_str_appendl(str, (char *)digest, 16);
+    } else {
+        /* Integer key - pack as 16 bytes (8 zeros + 8 byte integer) */
+        char packed[16] = {0};
+        #if SIZEOF_ZEND_LONG == 8
+            memcpy(packed + 8, &idx, 8);
+        #else
+            uint32_t idx32 = (uint32_t)idx;
+            memcpy(packed + 12, &idx32, 4);
+        #endif
+        smart_str_appendl(str, packed, 16);
     }
 }
 /* }}} */
 
-/* {{{ phan_hash_node_recursive
- * Recursively hash an AST Node object
- *
- * ast\Node objects store properties that we need to hash.
- * We use proper property lookup to avoid issues with OPcache optimization.
+/* {{{ phan_hash_value_xxh3
+ * Hash a value the same way PHP does
  */
-static void phan_hash_node_recursive(XXH3_state_t* state, zval *node)
+static void phan_hash_value_xxh3(smart_str *str, zval *val)
+{
+    if (val == NULL || Z_TYPE_P(val) == IS_NULL) {
+        /* NULL - return fixed 16-byte pattern */
+        smart_str_appendl(str, "\0\0\0\0\0\0\0\x02\0\0\0\0\0\0\0\0", 16);
+    } else if (Z_TYPE_P(val) == IS_STRING) {
+        /* String - hash with XXH3-128 */
+        PHP_XXH3_128_CTX context;
+        unsigned char digest[16];
+        PHP_XXH3_128_Init(&context, NULL);
+        PHP_XXH3_128_Update(&context, (unsigned char *)Z_STRVAL_P(val), Z_STRLEN_P(val));
+        PHP_XXH3_128_Final(digest, &context);
+        smart_str_appendl(str, (char *)digest, 16);
+    } else if (Z_TYPE_P(val) == IS_LONG) {
+        /* Integer - pack as 16 bytes */
+        char packed[16] = {0};
+        #if SIZEOF_ZEND_LONG == 8
+            memcpy(packed + 8, &Z_LVAL_P(val), 8);
+        #else
+            int32_t val32 = (int32_t)Z_LVAL_P(val);
+            memcpy(packed + 12, &val32, 4);
+        #endif
+        smart_str_appendl(str, packed, 16);
+    } else if (Z_TYPE_P(val) == IS_DOUBLE) {
+        /* Float - pack as 16 bytes with marker */
+        char packed[16];
+        memset(packed, 0, 8);
+        packed[7] = 1;
+        double dval = Z_DVAL_P(val);
+        memcpy(packed + 8, &dval, 8);
+        smart_str_appendl(str, packed, 16);
+    } else if (Z_TYPE_P(val) == IS_OBJECT) {
+        /* AST Node - recurse */
+        phan_hash_node_xxh3(str, val);
+    } else {
+        /* Unknown type - return fixed pattern */
+        smart_str_appendl(str, "\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0", 16);
+    }
+}
+/* }}} */
+
+/* {{{ phan_hash_node_xxh3
+ * Recursively hash an AST Node the same way PHP does
+ */
+static void phan_hash_node_xxh3(smart_str *str, zval *node)
 {
     zend_object *obj;
     zval *kind_zv, *flags_zv, *children_zv;
     zend_string *key;
     zval *child;
-    static int debug_enabled = -1;
+    zend_ulong idx;
     HashTable *props;
 
     if (Z_TYPE_P(node) != IS_OBJECT) {
-        phan_hash_value(state, node);
+        phan_hash_value_xxh3(str, node);
         return;
     }
 
     obj = Z_OBJ_P(node);
-
-    /* Check for debug mode once */
-    if (debug_enabled == -1) {
-        debug_enabled = getenv("PHAN_HELPERS_DEBUG") != NULL;
-    }
-
-    /* Get properties table directly - ast\Node has public properties */
     props = obj->handlers->get_properties(obj);
     if (!props) {
-        /* Fallback: empty hash for objects without properties */
-        XXH3_128bits_update(state, "\x00", 1);
         return;
     }
 
+    /* Get and dereference properties */
     kind_zv = zend_hash_str_find(props, "kind", sizeof("kind") - 1);
     flags_zv = zend_hash_str_find(props, "flags", sizeof("flags") - 1);
     children_zv = zend_hash_str_find(props, "children", sizeof("children") - 1);
 
-    /* Dereference if needed - properties may be IS_INDIRECT or IS_REFERENCE */
     if (kind_zv) {
-        ZVAL_DEREF(kind_zv);  /* Handle IS_REFERENCE */
-        if (Z_TYPE_P(kind_zv) == IS_INDIRECT) {  /* Handle IS_INDIRECT */
-            kind_zv = Z_INDIRECT_P(kind_zv);
-        }
+        ZVAL_DEREF(kind_zv);
+        if (Z_TYPE_P(kind_zv) == IS_INDIRECT) kind_zv = Z_INDIRECT_P(kind_zv);
     }
     if (flags_zv) {
         ZVAL_DEREF(flags_zv);
-        if (Z_TYPE_P(flags_zv) == IS_INDIRECT) {
-            flags_zv = Z_INDIRECT_P(flags_zv);
-        }
+        if (Z_TYPE_P(flags_zv) == IS_INDIRECT) flags_zv = Z_INDIRECT_P(flags_zv);
     }
     if (children_zv) {
         ZVAL_DEREF(children_zv);
-        if (Z_TYPE_P(children_zv) == IS_INDIRECT) {
-            children_zv = Z_INDIRECT_P(children_zv);
-        }
+        if (Z_TYPE_P(children_zv) == IS_INDIRECT) children_zv = Z_INDIRECT_P(children_zv);
     }
 
-    /* Hash kind property */
+    /* Build string: "N" + kind + ":" + flags */
+    smart_str_appendc(str, 'N');
     if (kind_zv && Z_TYPE_P(kind_zv) == IS_LONG) {
-        uint64_t kind = (uint64_t)Z_LVAL_P(kind_zv);
-        XXH3_128bits_update(state, "N", 1);  /* Node marker */
-        XXH3_128bits_update(state, &kind, sizeof(kind));
+        char kind_buf[32];
+        int kind_len = snprintf(kind_buf, sizeof(kind_buf), "%ld", Z_LVAL_P(kind_zv));
+        smart_str_appendl(str, kind_buf, kind_len);
     }
-
-    /* Hash flags property (masked to 20 bits like PHP version) */
+    smart_str_appendc(str, ':');
     if (flags_zv && Z_TYPE_P(flags_zv) == IS_LONG) {
-        uint64_t flags = (uint64_t)(Z_LVAL_P(flags_zv) & 0xfffff);
-        XXH3_128bits_update(state, ":", 1);
-        XXH3_128bits_update(state, &flags, sizeof(flags));
+        char flags_buf[32];
+        zend_long flags_masked = Z_LVAL_P(flags_zv) & 0x3ffffff;
+        int flags_len = snprintf(flags_buf, sizeof(flags_buf), "%ld", flags_masked);
+        smart_str_appendl(str, flags_buf, flags_len);
     }
 
-    /* Hash children array */
+    /* Process children */
     if (children_zv && Z_TYPE_P(children_zv) == IS_ARRAY) {
         HashTable *children_ht = Z_ARRVAL_P(children_zv);
-        zend_ulong idx;
-        int child_count = 0;
 
-        /* Iterate through children */
         ZEND_HASH_FOREACH_KEY_VAL(children_ht, idx, key, child) {
-            /* Skip keys starting with "phan" (added by PhanAnnotationAdder) */
+            /* Skip keys starting with "phan" */
             if (key && ZSTR_LEN(key) >= 4 && memcmp(ZSTR_VAL(key), "phan", 4) == 0) {
-                if (debug_enabled) {
-                    fprintf(stderr, "[phan_helpers]   Skipping phan-annotated key: %s\n", ZSTR_VAL(key));
-                }
                 continue;
             }
 
-            if (debug_enabled) {
-                if (key) {
-                    fprintf(stderr, "[phan_helpers]   Child #%d key=\"%s\"\n", child_count, ZSTR_VAL(key));
-                } else {
-                    fprintf(stderr, "[phan_helpers]   Child #%d key=%lu\n", child_count, idx);
-                }
+            /* Dereference child */
+            ZVAL_DEREF(child);
+            if (Z_TYPE_P(child) == IS_INDIRECT) {
+                child = Z_INDIRECT_P(child);
             }
 
-            /* Hash the key */
-            if (key) {
-                /* String key */
-                XXH3_128bits_update(state, ZSTR_VAL(key), ZSTR_LEN(key));
-            } else {
-                /* Integer key */
-                XXH3_128bits_update(state, &idx, sizeof(idx));
-            }
-
-            /* Recursively hash the child value */
-            phan_hash_value(state, child);
-            child_count++;
+            /* Hash key and value */
+            phan_hash_key_xxh3(str, idx, key);
+            phan_hash_value_xxh3(str, child);
         } ZEND_HASH_FOREACH_END();
-
-        if (debug_enabled) {
-            fprintf(stderr, "[phan_helpers]   Total children hashed: %d\n", child_count);
-        }
     }
 }
 /* }}} */
 
 /* {{{ PHP_FUNCTION(phan_ast_hash)
- * Fast XXH128 hashing of AST nodes
+ * XXH3-128-based hashing of AST nodes matching PHP implementation exactly
  *
  * This is a C implementation of ASTHasher::hash() and computeHash()
  *
@@ -284,68 +279,44 @@ static void phan_hash_node_recursive(XXH3_state_t* state, zval *node)
  *   mixed $node - AST Node object, or primitive value
  *
  * Returns:
- *   string - 16-byte binary XXH128 hash
+ *   string - 16-byte binary XXH3-128 hash
  */
 PHP_FUNCTION(phan_ast_hash)
 {
     zval *node;
-    XXH3_state_t* state;
-    XXH128_hash_t hash;
-    static int debug_enabled = -1;
+    smart_str str = {0};
+    PHP_XXH3_128_CTX context;
+    unsigned char digest[16];
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_ZVAL(node)
     ZEND_PARSE_PARAMETERS_END();
 
-    /* Check for debug mode once */
-    if (debug_enabled == -1) {
-        debug_enabled = getenv("PHAN_HELPERS_DEBUG") != NULL;
+    /* Handle non-objects directly */
+    if (!Z_ISREF_P(node) && Z_TYPE_P(node) != IS_OBJECT) {
+        phan_hash_value_xxh3(&str, node);
+        smart_str_0(&str);
+
+        /* Hash the built string */
+        PHP_XXH3_128_Init(&context, NULL);
+        PHP_XXH3_128_Update(&context, (unsigned char *)ZSTR_VAL(str.s), ZSTR_LEN(str.s));
+        PHP_XXH3_128_Final(digest, &context);
+
+        smart_str_free(&str);
+        RETURN_STRINGL((char *)digest, 16);
     }
 
-    /* Initialize XXH3 state for 128-bit hashing */
-    state = XXH3_createState();
-    if (!state) {
-        zend_throw_exception(zend_ce_exception, "Failed to create XXH3 state", 0);
-        RETURN_FALSE;
-    }
+    /* For objects, build the string representation */
+    phan_hash_value_xxh3(&str, node);
+    smart_str_0(&str);
 
-    if (XXH3_128bits_reset(state) == XXH_ERROR) {
-        XXH3_freeState(state);
-        zend_throw_exception(zend_ce_exception, "Failed to reset XXH3 state", 0);
-        RETURN_FALSE;
-    }
+    /* Hash the built string with XXH3-128 */
+    PHP_XXH3_128_Init(&context, NULL);
+    PHP_XXH3_128_Update(&context, (unsigned char *)ZSTR_VAL(str.s), ZSTR_LEN(str.s));
+    PHP_XXH3_128_Final(digest, &context);
 
-    if (debug_enabled) {
-        fprintf(stderr, "[phan_helpers] === phan_ast_hash() called ===\n");
-        if (Z_TYPE_P(node) == IS_OBJECT) {
-            fprintf(stderr, "[phan_helpers] Input: Object (handle %u)\n", Z_OBJ_HANDLE_P(node));
-        } else {
-            fprintf(stderr, "[phan_helpers] Input: Non-object (type %d)\n", Z_TYPE_P(node));
-        }
-    }
-
-    /* Hash the node */
-    phan_hash_value(state, node);
-
-    /* Get the final hash */
-    hash = XXH3_128bits_digest(state);
-    XXH3_freeState(state);
-
-    /* Convert XXH128_hash_t to 16-byte binary string */
-    /* XXH128 returns {low64, high64} in native endianness */
-    unsigned char result[16];
-    memcpy(result, &hash.low64, 8);
-    memcpy(result + 8, &hash.high64, 8);
-
-    if (debug_enabled) {
-        fprintf(stderr, "[phan_helpers] Output hash (hex): ");
-        for (int i = 0; i < 16; i++) {
-            fprintf(stderr, "%02x", result[i]);
-        }
-        fprintf(stderr, "\n\n");
-    }
-
-    RETURN_STRINGL((char *)result, 16);
+    smart_str_free(&str);
+    RETURN_STRINGL((char *)digest, 16);
 }
 /* }}} */
 
