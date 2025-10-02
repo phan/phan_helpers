@@ -134,15 +134,14 @@ php -d extension=modules/phan_helpers.so tests/001-basic.phpt
 
 ### `phan_ast_hash(Node|string|int|float|null $node): string`
 
-Fast XXH128 hashing of AST nodes for duplicate detection.
+Fast XXH3-128 hashing of AST nodes for duplicate detection.
 
 **Description**:
-This function is a C implementation of `Phan\AST\ASTHasher::computeHash()`. It generates a 16-byte XXH128 hash of AST nodes, ignoring line numbers and spacing to detect semantically identical code.
+This function is a C implementation of `Phan\AST\ASTHasher::computeHash()`. It generates a 16-byte XXH3-128 hash of AST nodes, ignoring line numbers and spacing to detect semantically identical code.
 
 **Performance**:
-- 2-3x faster than PHP implementation using md5
-- XXH128 provides better hash distribution than md5
-- Proper Zend API property access avoids OPcache corruption issues
+- 2-3x faster than PHP implementation using MD5
+- XXH3-128 provides better hash distribution and performance than MD5
 
 **Usage in Phan**:
 The function is automatically used by `ASTHasher::computeHash()` when available:
@@ -163,19 +162,17 @@ private static function computeHash(Node $node): string
 ```
 
 **Hash Algorithm**:
-- Recursively hashes AST node properties: kind, flags (masked to 20 bits), children
+- Recursively hashes AST node properties: kind, flags (masked to 26 bits), children
+- Normalizes all keys and values to 16 bytes before hashing (prevents collisions)
 - Skips keys starting with "phan" (added by PhanAnnotationAdder)
-- Uses XXH128 for fast, high-quality hashing
+- Uses XXH3-128 for fast, high-quality hashing
 - Returns 16-byte binary hash string
-
-**OPcache Safety**:
-The implementation uses proper Zend API methods (`obj->handlers->get_properties()` and `zend_hash_str_find()`) instead of direct `properties_table` access, preventing corruption when OPcache is enabled.
 
 ## Current Status
 
 **Implemented Functions**:
 - ✅ `phan_unique_types()` - Type deduplication (2-3x faster than PHP)
-- ✅ `phan_ast_hash()` - AST node hashing (2-3x faster with XXH128)
+- ✅ `phan_ast_hash()` - AST node hashing (2-3x faster with XXH3-128)
 
 **Future Considerations**:
 Additional performance-critical operations may be implemented based on profiling data from real-world Phan usage.
