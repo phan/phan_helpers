@@ -169,6 +169,8 @@ static void phan_hash_node_recursive(XXH3_state_t* state, zval *node)
     zval *kind_zv, *flags_zv, *children_zv;
     zend_string *key;
     zval *child;
+    static int debug_enabled = -1;
+    HashTable *props;
 
     if (Z_TYPE_P(node) != IS_OBJECT) {
         phan_hash_value(state, node);
@@ -177,19 +179,42 @@ static void phan_hash_node_recursive(XXH3_state_t* state, zval *node)
 
     obj = Z_OBJ_P(node);
 
-    /* ast\Node stores properties in either properties_table (for declared properties)
-     * or a dynamically allocated properties hashtable (when dynamic properties are added).
-     * OPcache can corrupt direct properties_table index access, so we use hash lookups.
-     */
-    HashTable *props = obj->properties;
-    if (!props) {
-        /* Properties haven't been moved to hashtable yet, need to build it */
-        props = obj->handlers->get_properties(obj);
+    /* Check for debug mode once */
+    if (debug_enabled == -1) {
+        debug_enabled = getenv("PHAN_HELPERS_DEBUG") != NULL;
     }
 
-    kind_zv = props ? zend_hash_str_find(props, "kind", sizeof("kind") - 1) : NULL;
-    flags_zv = props ? zend_hash_str_find(props, "flags", sizeof("flags") - 1) : NULL;
-    children_zv = props ? zend_hash_str_find(props, "children", sizeof("children") - 1) : NULL;
+    /* Get properties table directly - ast\Node has public properties */
+    props = obj->handlers->get_properties(obj);
+    if (!props) {
+        /* Fallback: empty hash for objects without properties */
+        XXH3_128bits_update(state, "\x00", 1);
+        return;
+    }
+
+    kind_zv = zend_hash_str_find(props, "kind", sizeof("kind") - 1);
+    flags_zv = zend_hash_str_find(props, "flags", sizeof("flags") - 1);
+    children_zv = zend_hash_str_find(props, "children", sizeof("children") - 1);
+
+    /* Dereference if needed - properties may be IS_INDIRECT or IS_REFERENCE */
+    if (kind_zv) {
+        ZVAL_DEREF(kind_zv);  /* Handle IS_REFERENCE */
+        if (Z_TYPE_P(kind_zv) == IS_INDIRECT) {  /* Handle IS_INDIRECT */
+            kind_zv = Z_INDIRECT_P(kind_zv);
+        }
+    }
+    if (flags_zv) {
+        ZVAL_DEREF(flags_zv);
+        if (Z_TYPE_P(flags_zv) == IS_INDIRECT) {
+            flags_zv = Z_INDIRECT_P(flags_zv);
+        }
+    }
+    if (children_zv) {
+        ZVAL_DEREF(children_zv);
+        if (Z_TYPE_P(children_zv) == IS_INDIRECT) {
+            children_zv = Z_INDIRECT_P(children_zv);
+        }
+    }
 
     /* Hash kind property */
     if (kind_zv && Z_TYPE_P(kind_zv) == IS_LONG) {
@@ -209,12 +234,24 @@ static void phan_hash_node_recursive(XXH3_state_t* state, zval *node)
     if (children_zv && Z_TYPE_P(children_zv) == IS_ARRAY) {
         HashTable *children_ht = Z_ARRVAL_P(children_zv);
         zend_ulong idx;
+        int child_count = 0;
 
         /* Iterate through children */
         ZEND_HASH_FOREACH_KEY_VAL(children_ht, idx, key, child) {
             /* Skip keys starting with "phan" (added by PhanAnnotationAdder) */
             if (key && ZSTR_LEN(key) >= 4 && memcmp(ZSTR_VAL(key), "phan", 4) == 0) {
+                if (debug_enabled) {
+                    fprintf(stderr, "[phan_helpers]   Skipping phan-annotated key: %s\n", ZSTR_VAL(key));
+                }
                 continue;
+            }
+
+            if (debug_enabled) {
+                if (key) {
+                    fprintf(stderr, "[phan_helpers]   Child #%d key=\"%s\"\n", child_count, ZSTR_VAL(key));
+                } else {
+                    fprintf(stderr, "[phan_helpers]   Child #%d key=%lu\n", child_count, idx);
+                }
             }
 
             /* Hash the key */
@@ -228,7 +265,12 @@ static void phan_hash_node_recursive(XXH3_state_t* state, zval *node)
 
             /* Recursively hash the child value */
             phan_hash_value(state, child);
+            child_count++;
         } ZEND_HASH_FOREACH_END();
+
+        if (debug_enabled) {
+            fprintf(stderr, "[phan_helpers]   Total children hashed: %d\n", child_count);
+        }
     }
 }
 /* }}} */
@@ -249,10 +291,16 @@ PHP_FUNCTION(phan_ast_hash)
     zval *node;
     XXH3_state_t* state;
     XXH128_hash_t hash;
+    static int debug_enabled = -1;
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_ZVAL(node)
     ZEND_PARSE_PARAMETERS_END();
+
+    /* Check for debug mode once */
+    if (debug_enabled == -1) {
+        debug_enabled = getenv("PHAN_HELPERS_DEBUG") != NULL;
+    }
 
     /* Initialize XXH3 state for 128-bit hashing */
     state = XXH3_createState();
@@ -267,6 +315,15 @@ PHP_FUNCTION(phan_ast_hash)
         RETURN_FALSE;
     }
 
+    if (debug_enabled) {
+        fprintf(stderr, "[phan_helpers] === phan_ast_hash() called ===\n");
+        if (Z_TYPE_P(node) == IS_OBJECT) {
+            fprintf(stderr, "[phan_helpers] Input: Object (handle %u)\n", Z_OBJ_HANDLE_P(node));
+        } else {
+            fprintf(stderr, "[phan_helpers] Input: Non-object (type %d)\n", Z_TYPE_P(node));
+        }
+    }
+
     /* Hash the node */
     phan_hash_value(state, node);
 
@@ -279,6 +336,14 @@ PHP_FUNCTION(phan_ast_hash)
     unsigned char result[16];
     memcpy(result, &hash.low64, 8);
     memcpy(result + 8, &hash.high64, 8);
+
+    if (debug_enabled) {
+        fprintf(stderr, "[phan_helpers] Output hash (hex): ");
+        for (int i = 0; i < 16; i++) {
+            fprintf(stderr, "%02x", result[i]);
+        }
+        fprintf(stderr, "\n\n");
+    }
 
     RETURN_STRINGL((char *)result, 16);
 }
