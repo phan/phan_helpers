@@ -171,19 +171,14 @@ private static function computeHash(Node $node): string
 **OPcache Safety**:
 The implementation uses proper Zend API methods (`obj->handlers->get_properties()` and `zend_hash_str_find()`) instead of direct `properties_table` access, preventing corruption when OPcache is enabled.
 
-## Roadmap
+## Current Status
 
-**Phase 1 (Current)**:
-- ✅ `phan_unique_types()` - Type deduplication
-- ✅ `phan_ast_hash()` - AST node hashing
+**Implemented Functions**:
+- ✅ `phan_unique_types()` - Type deduplication (2-3x faster than PHP)
+- ✅ `phan_ast_hash()` - AST node hashing (2-3x faster with XXH128)
 
-**Phase 2**:
-- `phan_intern_type()` - Type interning system
-- `phan_can_cast()` - Type compatibility checking
-
-**Phase 3**:
-- `phan_map_*()` - FQSEN map operations
-- `phan_parse_fqsen()` - FQSEN string parsing
+**Future Considerations**:
+Additional performance-critical operations may be implemented based on profiling data from real-world Phan usage.
 
 ## License
 
