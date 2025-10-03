@@ -190,13 +190,21 @@ static void phan_hash_value_xxh3(smart_str *str, zval *val)
         #endif
         smart_str_appendl(str, packed, 16);
     } else if (Z_TYPE_P(val) == IS_DOUBLE) {
-        /* Float - pack as 16 bytes with marker */
-        char packed[16];
-        memset(packed, 0, 8);
+        /* Float - pack marker + IEEE 754 binary32 in little endian */
+        char packed[12] = {0};
+        float fval = (float)Z_DVAL_P(val);
+        uint32_t bits;
+
         packed[7] = 1;
-        double dval = Z_DVAL_P(val);
-        memcpy(packed + 8, &dval, 8);
-        smart_str_appendl(str, packed, 16);
+        memcpy(&bits, &fval, sizeof(bits));
+#if ZEND_BYTE_ORDER == ZEND_BIG_ENDIAN
+        bits = ((bits & 0x000000FF) << 24)
+             | ((bits & 0x0000FF00) << 8)
+             | ((bits & 0x00FF0000) >> 8)
+             | ((bits & 0xFF000000) >> 24);
+#endif
+        memcpy(packed + 8, &bits, sizeof(bits));
+        smart_str_appendl(str, packed, sizeof(packed));
     } else if (Z_TYPE_P(val) == IS_OBJECT) {
         /* AST Node - hash it first, then append the hash (like PHP does) */
         smart_str child_str = {0};
@@ -318,6 +326,7 @@ static void phan_hash_node_xxh3(smart_str *str, zval *node)
 PHP_FUNCTION(phan_ast_hash)
 {
     zval *node;
+    zval *resolved;
     smart_str str = {0};
     PHP_XXH3_128_CTX context;
     unsigned char digest[16];
@@ -326,9 +335,15 @@ PHP_FUNCTION(phan_ast_hash)
         Z_PARAM_ZVAL(node)
     ZEND_PARSE_PARAMETERS_END();
 
+    resolved = node;
+    if (Z_TYPE_P(resolved) == IS_INDIRECT) {
+        resolved = Z_INDIRECT_P(resolved);
+    }
+    ZVAL_DEREF(resolved);
+
     /* Handle non-objects directly */
-    if (!Z_ISREF_P(node) && Z_TYPE_P(node) != IS_OBJECT) {
-        phan_hash_value_xxh3(&str, node);
+    if (Z_TYPE_P(resolved) != IS_OBJECT) {
+        phan_hash_value_xxh3(&str, resolved);
         smart_str_0(&str);
 
         /* Hash the built string */
@@ -341,7 +356,7 @@ PHP_FUNCTION(phan_ast_hash)
     }
 
     /* For objects, hash the node string */
-    phan_hash_node_xxh3(&str, node);
+    phan_hash_node_xxh3(&str, resolved);
     smart_str_0(&str);
 
     /* Hash the built string with XXH3-128 */
