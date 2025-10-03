@@ -165,11 +165,28 @@ static void phan_hash_value_xxh3(smart_str *str, zval *val)
     } else if (Z_TYPE_P(val) == IS_LONG) {
         /* Integer - pack as 16 bytes */
         char packed[16] = {0};
+        zend_long lval = Z_LVAL_P(val);
         #if SIZEOF_ZEND_LONG == 8
-            memcpy(packed + 8, &Z_LVAL_P(val), 8);
+            /* memcpy(packed + 8, &Z_LVAL_P(val), 8); */
+            /* Big-endian version instead */
+            packed[8]  = (lval >> 56) & 0xFF;
+            packed[9]  = (lval >> 48) & 0xFF;
+            packed[10] = (lval >> 40) & 0xFF;
+            packed[11] = (lval >> 32) & 0xFF;
+            packed[12] = (lval >> 24) & 0xFF;
+            packed[13] = (lval >> 16) & 0xFF;
+            packed[14] = (lval >> 8) & 0xFF;
+            packed[15] = lval & 0xFF;
         #else
+            /*
             int32_t val32 = (int32_t)Z_LVAL_P(val);
             memcpy(packed + 12, &val32, 4);
+            */
+            int32_t val32 = (int32_t)lval;
+            packed[12] = (val32 >> 24) & 0xFF;
+            packed[13] = (val32 >> 16) & 0xFF;
+            packed[14] = (val32 >> 8) & 0xFF;
+            packed[15] = val32 & 0xFF;
         #endif
         smart_str_appendl(str, packed, 16);
     } else if (Z_TYPE_P(val) == IS_DOUBLE) {
@@ -181,8 +198,21 @@ static void phan_hash_value_xxh3(smart_str *str, zval *val)
         memcpy(packed + 8, &dval, 8);
         smart_str_appendl(str, packed, 16);
     } else if (Z_TYPE_P(val) == IS_OBJECT) {
-        /* AST Node - recurse */
-        phan_hash_node_xxh3(str, val);
+        /* AST Node - hash it first, then append the hash (like PHP does) */
+        smart_str child_str = {0};
+        PHP_XXH3_128_CTX context;
+        unsigned char digest[16];
+
+        phan_hash_node_xxh3(&child_str, val);
+        smart_str_0(&child_str);
+
+        /* Hash the child's string representation */
+        PHP_XXH3_128_Init(&context, NULL);
+        PHP_XXH3_128_Update(&context, (unsigned char *)ZSTR_VAL(child_str.s), ZSTR_LEN(child_str.s));
+        PHP_XXH3_128_Final(digest, &context);
+
+        smart_str_free(&child_str);
+        smart_str_appendl(str, (char *)digest, 16);
     } else {
         /* Unknown type - return fixed pattern */
         smart_str_appendl(str, "\0\0\0\0\0\0\0\x01\0\0\0\0\0\0\0\0", 16);
@@ -228,7 +258,11 @@ static void phan_hash_node_xxh3(smart_str *str, zval *node)
     }
     if (children_zv) {
         ZVAL_DEREF(children_zv);
-        if (Z_TYPE_P(children_zv) == IS_INDIRECT) children_zv = Z_INDIRECT_P(children_zv);
+        if (Z_TYPE_P(children_zv) == IS_INDIRECT) {
+            children_zv = Z_INDIRECT_P(children_zv);
+            /* After dereferencing IS_INDIRECT, we may have an IS_REFERENCE, so deref again */
+            ZVAL_DEREF(children_zv);
+        }
     }
 
     /* Build string: "N" + kind + ":" + flags */
@@ -306,8 +340,8 @@ PHP_FUNCTION(phan_ast_hash)
         RETURN_STRINGL((char *)digest, 16);
     }
 
-    /* For objects, build the string representation */
-    phan_hash_value_xxh3(&str, node);
+    /* For objects, hash the node string */
+    phan_hash_node_xxh3(&str, node);
     smart_str_0(&str);
 
     /* Hash the built string with XXH3-128 */
